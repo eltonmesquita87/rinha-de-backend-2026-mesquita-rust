@@ -1,8 +1,9 @@
 /target
 .claude
 
-# Briefing original; nao entra na submission
+# Briefing original e clones auxiliares; nao entram na submission
 /prompt
+/submission
 
 # Artefatos gerados a partir do dataset; versionamos apenas o references.json.gz
 /data/references.bin
