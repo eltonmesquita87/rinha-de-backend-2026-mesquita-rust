@@ -13,7 +13,8 @@ RUN cargo build --release --locked
 COPY data ./data
 RUN /build/target/release/preprocess \
         --input /build/data/references.json.gz \
-        --output /build/data/references.bin
+        --output /build/data/references.bin \
+        --max-per-class 15000
 
 FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 --create-home appuser

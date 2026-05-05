@@ -1,0 +1,116 @@
+{
+  "repo-url": "https://github.com/eltonmesquita87/rinha-de-backend-2026-mesquita-rust",
+  "test-results": {
+    "expected": {
+      "total": 54100,
+      "fraud_count": 24058,
+      "legit_count": 30042,
+      "fraud_rate": 0.4447,
+      "legit_rate": 0.5553,
+      "edge_case_count": 797,
+      "edge_case_rate": 0.0147
+    },
+    "p99": "2002.85ms",
+    "scoring": {
+      "breakdown": {
+        "false_positive_detections": 0,
+        "false_negative_detections": 0,
+        "true_positive_detections": 83,
+        "true_negative_detections": 103,
+        "http_errors": 16992
+      },
+      "failure_rate": "98.92%",
+      "weighted_errors_E": 84960,
+      "error_rate_epsilon": 4.945861,
+      "p99_score": {
+        "value": -3000,
+        "cut_triggered": true
+      },
+      "detection_score": {
+        "value": -3000,
+        "rate_component": null,
+        "absolute_penalty": null,
+        "cut_triggered": true
+      },
+      "final_score": -6000
+    }
+  },
+  "runtime-info": {
+    "mem": 350,
+    "cpu": 1,
+    "images": {
+      "haproxy:2.9-alpine": [
+        {
+          "Name": "/submission-haproxy-1",
+          "Platform": "linux",
+          "Image": "haproxy:2.9-alpine",
+          "Service": "haproxy",
+          "HostConfig": {
+            "NetworkMode": "submission_rinha-net",
+            "Memory": 20971520,
+            "NanoCpus": 50000000,
+            "IpcMode": "private",
+            "Binds": [
+              "<redacted>/submission_sock:/run/sock:rw",
+              "<redacted>/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"
+            ],
+            "PidMode": "",
+            "CapAdd": null,
+            "PortBindings": {
+              "tcp": [
+                {
+                  "HostIp": "",
+                  "HostPort": "9999"
+                }
+              ]
+            },
+            "Privileged": false
+          }
+        }
+      ],
+      "eltonmesquita87/rinha-fraude-vetorial:latest": [
+        {
+          "Name": "/submission-api2-1",
+          "Platform": "linux",
+          "Image": "eltonmesquita87/rinha-fraude-vetorial:latest",
+          "Service": "api2",
+          "HostConfig": {
+            "NetworkMode": "submission_rinha-net",
+            "Memory": 173015040,
+            "NanoCpus": 475000000,
+            "IpcMode": "private",
+            "Binds": [
+              "<redacted>/submission_sock:/run/sock:rw"
+            ],
+            "PidMode": "",
+            "CapAdd": null,
+            "PortBindings": {},
+            "Privileged": false
+          }
+        },
+        {
+          "Name": "/submission-api1-1",
+          "Platform": "linux",
+          "Image": "eltonmesquita87/rinha-fraude-vetorial:latest",
+          "Service": "api1",
+          "HostConfig": {
+            "NetworkMode": "submission_rinha-net",
+            "Memory": 173015040,
+            "NanoCpus": 475000000,
+            "IpcMode": "private",
+            "Binds": [
+              "<redacted>/submission_sock:/run/sock:rw"
+            ],
+            "PidMode": "",
+            "CapAdd": null,
+            "PortBindings": {},
+            "Privileged": false
+          }
+        }
+      ]
+    },
+    "instances-number-ok?": true,
+    "unlimited-services": null,
+    "commit": "3919a4c"
+  }
+}

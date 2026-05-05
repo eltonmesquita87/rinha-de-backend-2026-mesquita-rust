@@ -190,6 +190,65 @@ impl ReferenceDataset {
         self.top5_labels(query)
             .map(|labels| labels.into_iter().map(|label| u8::from(label != 0)).sum())
     }
+
+    pub fn stratified_subsample(&self, per_class: usize, seed: u64) -> Self {
+        let mut fraud_indices = Vec::new();
+        let mut legit_indices = Vec::new();
+        for (index, &label) in self.labels.iter().enumerate() {
+            if label != 0 {
+                fraud_indices.push(index);
+            } else {
+                legit_indices.push(index);
+            }
+        }
+
+        let mut rng = SplitMix64::new(seed);
+        partial_fisher_yates(&mut fraud_indices, per_class, &mut rng);
+        partial_fisher_yates(&mut legit_indices, per_class, &mut rng);
+
+        let take_fraud = fraud_indices.len().min(per_class);
+        let take_legit = legit_indices.len().min(per_class);
+        let total = take_fraud + take_legit;
+
+        let mut output = Self::with_capacity(total);
+        for &source in fraud_indices[..take_fraud]
+            .iter()
+            .chain(legit_indices[..take_legit].iter())
+        {
+            let offset = source * VECTOR_DIMENSIONS;
+            let mut vector = [0i16; VECTOR_DIMENSIONS];
+            vector.copy_from_slice(&self.vectors[offset..offset + VECTOR_DIMENSIONS]);
+            output.push_quantized_vector(&vector, self.labels[source]);
+        }
+        output
+    }
+}
+
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+fn partial_fisher_yates(indices: &mut [usize], take: usize, rng: &mut SplitMix64) {
+    let take = take.min(indices.len());
+    for slot in 0..take {
+        let remaining = (indices.len() - slot) as u64;
+        let pick = slot + (rng.next_u64() % remaining) as usize;
+        indices.swap(slot, pick);
+    }
 }
 
 impl<'de> Deserialize<'de> for ReferenceDataset {
@@ -753,6 +812,46 @@ mod tests {
         // sentinela na q (5000) vs sentinela no candidato (-10000) -> delta 15000 nas dims 5 e 6.
         let expected = 2 * (15_000i64 * 15_000i64);
         assert_eq!(distance, expected);
+    }
+
+    #[test]
+    fn stratified_subsample_balances_classes_and_is_deterministic() {
+        let mut dataset = ReferenceDataset::with_capacity(1_000);
+        for index in 0..600 {
+            let mut vector = [0.0; VECTOR_DIMENSIONS];
+            vector[0] = (index as f32) / 600.0;
+            dataset.push_float_vector(&vector, 1);
+        }
+        for index in 0..400 {
+            let mut vector = [0.0; VECTOR_DIMENSIONS];
+            vector[0] = (index as f32) / 400.0;
+            dataset.push_float_vector(&vector, 0);
+        }
+
+        let first = dataset.stratified_subsample(50, 42);
+        let second = dataset.stratified_subsample(50, 42);
+        let third = dataset.stratified_subsample(50, 99);
+
+        assert_eq!(first.len(), 100);
+        let fraud_count: usize =
+            first.labels.iter().map(|&label| (label != 0) as usize).sum();
+        assert_eq!(fraud_count, 50);
+        assert_eq!(first.vectors, second.vectors);
+        assert_ne!(first.vectors, third.vectors);
+    }
+
+    #[test]
+    fn stratified_subsample_caps_at_available_records_per_class() {
+        let mut dataset = ReferenceDataset::with_capacity(20);
+        for _ in 0..5 {
+            dataset.push_float_vector(&[0.1; VECTOR_DIMENSIONS], 1);
+        }
+        for _ in 0..15 {
+            dataset.push_float_vector(&[0.2; VECTOR_DIMENSIONS], 0);
+        }
+
+        let sampled = dataset.stratified_subsample(10, 7);
+        assert_eq!(sampled.len(), 5 + 10);
     }
 
     #[test]
