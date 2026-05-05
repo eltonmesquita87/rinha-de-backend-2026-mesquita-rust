@@ -1,3 +1,22 @@
+x-api: &api
+  image: eltonmesquita87/rinha-fraude-vetorial:latest
+  platform: linux/amd64
+  networks:
+    - rinha-net
+  volumes:
+    - sock:/run/sock
+  privileged: false
+  read_only: true
+  tmpfs:
+    - /tmp:size=8m,noexec,nosuid
+  cpus: 0.475
+  mem_limit: 165m
+  deploy:
+    resources:
+      limits:
+        cpus: "0.475"
+        memory: 165M
+
 services:
   haproxy:
     image: haproxy:2.9-alpine
@@ -8,6 +27,7 @@ services:
       - "9999:9999"
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock:/run/sock
     depends_on:
       - api1
       - api2
@@ -21,52 +41,25 @@ services:
           memory: 20M
 
   api1:
-    # Substitua pelo seu registry/usuario antes de publicar.
-    image: eltonmesquita87/rinha-fraude-vetorial:latest
-    build: .
-    platform: linux/amd64
-    networks:
-      - rinha-net
+    <<: *api
     environment:
       DATA_DIR: /app/data
-      PORT: "8080"
-    expose:
-      - "8080"
-    privileged: false
-    cpus: 0.475
-    mem_limit: 165m
-    read_only: true
-    tmpfs:
-      - /tmp:size=8m,noexec,nosuid
-    deploy:
-      resources:
-        limits:
-          cpus: "0.475"
-          memory: 165M
+      SOCKET_PATH: /run/sock/api1.sock
 
   api2:
-    image: eltonmesquita87/rinha-fraude-vetorial:latest
-    build: .
-    platform: linux/amd64
-    networks:
-      - rinha-net
+    <<: *api
     environment:
       DATA_DIR: /app/data
-      PORT: "8080"
-    expose:
-      - "8080"
-    privileged: false
-    cpus: 0.475
-    mem_limit: 165m
-    read_only: true
-    tmpfs:
-      - /tmp:size=8m,noexec,nosuid
-    deploy:
-      resources:
-        limits:
-          cpus: "0.475"
-          memory: 165M
+      SOCKET_PATH: /run/sock/api2.sock
 
 networks:
   rinha-net:
     driver: bridge
+
+volumes:
+  sock:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4m,mode=0777"
