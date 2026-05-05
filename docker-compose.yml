@@ -1,0 +1,72 @@
+services:
+  haproxy:
+    image: haproxy:2.9-alpine
+    platform: linux/amd64
+    networks:
+      - rinha-net
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - api1
+      - api2
+    privileged: false
+    cpus: 0.05
+    mem_limit: 20m
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: 20M
+
+  api1:
+    # Substitua pelo seu registry/usuario antes de publicar.
+    image: eltonmesquita87/rinha-fraude-vetorial:latest
+    build: .
+    platform: linux/amd64
+    networks:
+      - rinha-net
+    environment:
+      DATA_DIR: /app/data
+      PORT: "8080"
+    expose:
+      - "8080"
+    privileged: false
+    cpus: 0.475
+    mem_limit: 165m
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    deploy:
+      resources:
+        limits:
+          cpus: "0.475"
+          memory: 165M
+
+  api2:
+    image: eltonmesquita87/rinha-fraude-vetorial:latest
+    build: .
+    platform: linux/amd64
+    networks:
+      - rinha-net
+    environment:
+      DATA_DIR: /app/data
+      PORT: "8080"
+    expose:
+      - "8080"
+    privileged: false
+    cpus: 0.475
+    mem_limit: 165m
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    deploy:
+      resources:
+        limits:
+          cpus: "0.475"
+          memory: 165M
+
+networks:
+  rinha-net:
+    driver: bridge
