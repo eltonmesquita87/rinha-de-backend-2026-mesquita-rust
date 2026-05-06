@@ -1,3 +1,7 @@
 target
 .git
 prompt
+submission
+data/references.json
+data/references.bin
+data/references.index.bin

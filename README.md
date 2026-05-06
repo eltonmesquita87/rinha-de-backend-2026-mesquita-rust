@@ -8,8 +8,8 @@ A Rinha de Backend 2026 propoe um servico que recebe transacoes financeiras e de
 
 A regra base do desafio e:
 
-- Para cada requisicao em `POST /fraud-score`, o servico deve transformar a transacao em um vetor de features e localizar os 5 vizinhos mais proximos dentro de um conjunto de 3.000.000 transacoes de referencia.
-- A partir desses vizinhos, calcula-se um score baseado na proporcao de fraudes vistas e na distancia, e responde-se conforme o contrato oficial.
+- Para cada requisicao em `POST /fraud-score`, o servico deve transformar a transacao em um vetor de features e localizar vizinhos proximos dentro de um conjunto de 3.000.000 transacoes de referencia.
+- A partir dos 5 melhores vizinhos encontrados, calcula-se `fraud_score = fraudes / 5` e responde-se conforme o contrato oficial.
 - O servico precisa rodar dentro de um envelope severo: 1 CPU e 350 MB de memoria total, distribuidos entre proxy e duas APIs.
 - A nota considera latencia (p99 e media), taxa de erro e qualidade do score, entao tanto a velocidade do kNN quanto a fidelidade do modelo importam.
 
@@ -33,9 +33,9 @@ client -> localhost:9999 -> haproxy -> api1 / api2
 Limites por container (configuracao oficial da Rinha):
 
 ```text
-haproxy: 0.05 CPU /  20 MB
-api1:    0.475 CPU / 165 MB
-api2:    0.475 CPU / 165 MB
+haproxy: 0.05 CPU /  12 MB
+api1:    0.475 CPU / 169 MB
+api2:    0.475 CPU / 169 MB
 total:   1.0  CPU / 350 MB
 ```
 
@@ -43,15 +43,15 @@ total:   1.0  CPU / 350 MB
 
 1. O `main` carrega `FraudEngine` no startup, fazendo `Box::leak` para entregar uma referencia `'static` ao roteador `axum`.
 2. `GET /ready` responde `204 No Content` apenas depois que a carga do dataset terminou.
-3. `POST /fraud-score` desserializa o JSON, delega a pontuacao a um `spawn_blocking` (a busca e CPU-bound) e responde com o JSON do contrato oficial.
+3. `POST /fraud-score` desserializa o JSON, consulta o indice em memoria e responde com o JSON do contrato oficial.
 
 ### Decisoes do motor de fraude
 
 - **Armazenamento**: vetores de referencia ficam em `Vec<i16>` linear com `N * 14` posicoes e labels em `Vec<u8>`. A quantizacao usa escala 10000 e preserva o sentinela `-1`.
-- **Busca**: brute force exata sobre o bloco linear, calculando distancia euclidiana ao quadrado e mantendo o top 5 em arrays fixos sem alocacao por requisicao.
-- **Memoria**: 3.000.000 vetores ocupam ~84 MB de vetores quantizados e ~3 MB de labels por instancia, deixando margem para runtime e parser dentro de 165 MB por API.
-- **Pre-processamento**: o build do Docker gera `references.bin` a partir de `references.json.gz`, eliminando o parse de JSON no startup. Em execucao local, a API usa `references.bin` se existir; caso contrario, faz fallback para o `.json.gz`.
-- **Riscos conhecidos**: o p99 e sensivel a brute force em 3M vetores por request; o startup com `references.json.gz` e caro, por isso o `references.bin` e a forma recomendada.
+- **Busca**: LSH multi-probe compacto para selecionar candidatos proximos e re-ranqueamento por distancia euclidiana ao quadrado. Em bases pequenas ou fallback sem indice, usa brute force exata.
+- **Memoria**: 3.000.000 vetores ocupam ~84 MB de vetores quantizados, ~3 MB de labels e ~36 MB de indice por instancia, ficando dentro do limite ajustado para 169 MB por API.
+- **Pre-processamento**: o build do Docker gera `references.bin` e `references.index.bin` a partir de `references.json.gz`, eliminando parse de JSON e construcao do indice no startup. Em execucao local, a API usa os binarios se existirem; caso contrario, faz fallback para o `.json.gz` e monta o indice em memoria.
+- **Riscos conhecidos**: o LSH e uma busca aproximada. Ele reduz p99 e erros por timeout, mas precisa ser medido contra a massa oficial para calibrar qualidade de deteccao.
 
 ### Layout do codigo
 
@@ -59,12 +59,13 @@ total:   1.0  CPU / 350 MB
 src/
   main.rs               # Bootstrap axum, suporte a TCP e Unix socket
   lib.rs                # FraudEngine: carga, vetorizacao, kNN e score
-  bin/preprocess.rs     # Converte references.json.gz em references.bin
+  bin/preprocess.rs     # Converte references.json.gz em references.bin + references.index.bin
 data/
   normalization.json    # Parametros de normalizacao das features
   mcc_risk.json         # Score de risco por MCC
   references.json.gz    # Dataset bruto (entrada do preprocess)
-  references.bin        # Dataset binario pronto para mmap-like load
+  references.bin        # Dataset binario quantizado
+  references.index.bin  # Indice LSH gerado a partir do dataset completo
 ```
 
 ## 3. Tecnologias utilizadas
@@ -101,10 +102,10 @@ data/
 Para evitar o custo de descompactar e parsear o JSON a cada startup, gere o binario compacto:
 
 ```powershell
-cargo run --release --bin preprocess -- --input data/references.json.gz --output data/references.bin
+cargo run --release --bin preprocess -- --input data/references.json.gz --output data/references.bin --index-output data/references.index.bin
 ```
 
-Quando `data/references.bin` existir, a API usa esse arquivo; caso contrario, ela carrega o `.json.gz`.
+Quando `data/references.bin` e `data/references.index.bin` existirem, a API usa esses arquivos; caso contrario, ela carrega o `.json.gz` e monta o indice no startup.
 
 ### Subir a API direto com cargo
 

@@ -7,15 +7,16 @@ use rinha_fraude_vetorial::{FraudEngine, FraudRequest, ResourcePaths};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> Result<(), BoxError> {
     let paths = ResourcePaths::from_env();
     let engine: &'static FraudEngine = Box::leak(Box::new(FraudEngine::load(&paths)?));
 
     eprintln!(
-        "loaded {} references using {} bytes",
+        "loaded {} references using {} bytes plus {} index bytes",
         engine.reference_count(),
-        engine.reference_memory_bytes()
+        engine.reference_memory_bytes(),
+        engine.index_memory_bytes()
     );
 
     let app = Router::new()
@@ -74,9 +75,7 @@ async fn serve_unix(app: Router, path: std::path::PathBuf) -> Result<(), BoxErro
         // IntoMakeService is always ready; descarta o Infallible da resposta.
         let tower_service = match make_service.call(()).await {
             Ok(svc) => svc,
-            Err(unreachable) => match unreachable {
-                _ => unreachable!(),
-            },
+            Err(unreachable) => match unreachable {},
         };
 
         tokio::spawn(async move {
@@ -112,9 +111,8 @@ async fn fraud_score(
     State(engine): State<&'static FraudEngine>,
     Json(request): Json<FraudRequest>,
 ) -> impl IntoResponse {
-    match tokio::task::spawn_blocking(move || engine.score(&request)).await {
-        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
-        Ok(Err(_)) => StatusCode::BAD_REQUEST.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    match engine.score(&request) {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(_) => StatusCode::BAD_REQUEST.into_response(),
     }
 }

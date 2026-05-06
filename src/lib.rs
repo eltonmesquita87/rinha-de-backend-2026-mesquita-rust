@@ -2,6 +2,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 use flate2::read::GzDecoder;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -12,11 +13,74 @@ use std::path::{Path, PathBuf};
 pub const VECTOR_DIMENSIONS: usize = 14;
 pub const TOP_K: usize = 5;
 pub const QUANTIZATION_SCALE: f32 = 10_000.0;
+pub const LSH_TABLES: usize = 3;
+pub const LSH_BITS: usize = 13;
+pub const LSH_BUCKETS: usize = 1 << LSH_BITS;
 const BINARY_MAGIC: &[u8; 8] = b"RFVEC01\0";
+const INDEX_MAGIC: &[u8; 8] = b"RFIDX01\0";
 const DEFAULT_REFERENCE_HINT: usize = 3_000_000;
+const EXACT_SCAN_RECORD_LIMIT: usize = 100_000;
+const MAX_INDEX_CANDIDATES: usize = 65_536;
+const LSH_WEIGHTS: [[[i32; VECTOR_DIMENSIONS]; LSH_BITS]; LSH_TABLES] = build_lsh_weights();
+const LSH_BIASES: [[i32; LSH_BITS]; LSH_TABLES] = build_lsh_biases();
+
+const fn splitmix64_value(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+const fn build_lsh_weights() -> [[[i32; VECTOR_DIMENSIONS]; LSH_BITS]; LSH_TABLES] {
+    let mut weights = [[[0i32; VECTOR_DIMENSIONS]; LSH_BITS]; LSH_TABLES];
+    let mut table = 0;
+    while table < LSH_TABLES {
+        let mut bit = 0;
+        while bit < LSH_BITS {
+            let mut dimension = 0;
+            while dimension < VECTOR_DIMENSIONS {
+                let seed = 0xA24B_AED4_963E_E407u64
+                    ^ ((table as u64) << 40)
+                    ^ ((bit as u64) << 24)
+                    ^ ((dimension as u64) << 8);
+                let raw = splitmix64_value(seed);
+                let magnitude = ((raw % 7) + 1) as i32;
+                weights[table][bit][dimension] = if (raw & 1) == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                };
+                dimension += 1;
+            }
+            bit += 1;
+        }
+        table += 1;
+    }
+    weights
+}
+
+const fn build_lsh_biases() -> [[i32; LSH_BITS]; LSH_TABLES] {
+    let mut biases = [[0i32; LSH_BITS]; LSH_TABLES];
+    let mut table = 0;
+    while table < LSH_TABLES {
+        let mut bit = 0;
+        while bit < LSH_BITS {
+            let seed = 0xD6E8_FD90_5C27_31D1u64 ^ ((table as u64) << 32) ^ bit as u64;
+            let raw = splitmix64_value(seed);
+            biases[table][bit] = (raw % 80_001) as i32 - 40_000;
+            bit += 1;
+        }
+        table += 1;
+    }
+    biases
+}
 
 pub type MccRisk = HashMap<String, f32>;
 pub type BoxError = Box<dyn Error + Send + Sync>;
+
+thread_local! {
+    static INDEX_CANDIDATES: RefCell<Vec<u32>> = RefCell::new(Vec::with_capacity(16_384));
+}
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct Normalization {
@@ -163,9 +227,7 @@ impl ReferenceDataset {
         let mut worst_distance = i64::MAX;
 
         let labels = self.labels.as_slice();
-        for (record_index, candidate) in
-            self.vectors.chunks_exact(VECTOR_DIMENSIONS).enumerate()
-        {
+        for (record_index, candidate) in self.vectors.chunks_exact(VECTOR_DIMENSIONS).enumerate() {
             let distance = squared_distance_i16(query, candidate);
 
             if distance < worst_distance {
@@ -189,6 +251,73 @@ impl ReferenceDataset {
     pub fn fraud_count_top5(&self, query: &[i16; VECTOR_DIMENSIONS]) -> Option<u8> {
         self.top5_labels(query)
             .map(|labels| labels.into_iter().map(|label| u8::from(label != 0)).sum())
+    }
+
+    pub fn fraud_count_top5_indexed(
+        &self,
+        query: &[i16; VECTOR_DIMENSIONS],
+        index: &LshIndex,
+    ) -> Option<u8> {
+        if self.labels.len() < TOP_K || index.record_count() != self.labels.len() {
+            return None;
+        }
+
+        INDEX_CANDIDATES.with(|cell| {
+            let mut candidates = cell.borrow_mut();
+            index.collect_candidates(query, &mut candidates);
+            if candidates.len() < TOP_K {
+                return None;
+            }
+
+            candidates.sort_unstable();
+            candidates.dedup();
+            self.top5_labels_for_indices(query, &candidates)
+                .map(|labels| labels.into_iter().map(|label| u8::from(label != 0)).sum())
+        })
+    }
+
+    fn top5_labels_for_indices(
+        &self,
+        query: &[i16; VECTOR_DIMENSIONS],
+        candidates: &[u32],
+    ) -> Option<[u8; TOP_K]> {
+        if candidates.len() < TOP_K {
+            return None;
+        }
+
+        let mut top_distances = [i64::MAX; TOP_K];
+        let mut top_labels = [0u8; TOP_K];
+        let mut worst_index = 0usize;
+        let mut worst_distance = i64::MAX;
+        let mut accepted = 0usize;
+
+        for &record_index in candidates {
+            let record_index = record_index as usize;
+            if record_index >= self.labels.len() {
+                continue;
+            }
+
+            let offset = record_index * VECTOR_DIMENSIONS;
+            let candidate = &self.vectors[offset..offset + VECTOR_DIMENSIONS];
+            let distance = squared_distance_i16(query, candidate);
+
+            if distance < worst_distance {
+                top_distances[worst_index] = distance;
+                top_labels[worst_index] = self.labels[record_index];
+                accepted += 1;
+
+                worst_index = 0;
+                worst_distance = top_distances[0];
+                for slot in 1..TOP_K {
+                    if top_distances[slot] > worst_distance {
+                        worst_index = slot;
+                        worst_distance = top_distances[slot];
+                    }
+                }
+            }
+        }
+
+        (accepted >= TOP_K).then_some(top_labels)
     }
 
     pub fn stratified_subsample(&self, per_class: usize, seed: u64) -> Self {
@@ -221,6 +350,100 @@ impl ReferenceDataset {
             output.push_quantized_vector(&vector, self.labels[source]);
         }
         output
+    }
+}
+
+#[derive(Debug)]
+pub struct LshIndex {
+    record_count: usize,
+    offsets: Vec<u32>,
+    indices: Vec<u32>,
+}
+
+impl LshIndex {
+    pub fn build(dataset: &ReferenceDataset) -> Result<Self, BoxError> {
+        if dataset.len() > u32::MAX as usize {
+            return Err("reference dataset is too large for u32 index entries".into());
+        }
+
+        let record_count = dataset.len();
+        let mut offsets = vec![0u32; LSH_TABLES * (LSH_BUCKETS + 1)];
+        let mut indices = vec![0u32; LSH_TABLES * record_count];
+
+        for table in 0..LSH_TABLES {
+            let table_offsets_start = table * (LSH_BUCKETS + 1);
+            let table_offsets =
+                &mut offsets[table_offsets_start..table_offsets_start + LSH_BUCKETS + 1];
+            let mut hashes = Vec::with_capacity(record_count);
+
+            for candidate in dataset.vectors.chunks_exact(VECTOR_DIMENSIONS) {
+                let bucket = lsh_hash(table, candidate) as usize;
+                hashes.push(bucket as u16);
+                table_offsets[bucket + 1] += 1;
+            }
+
+            for bucket in 1..=LSH_BUCKETS {
+                table_offsets[bucket] += table_offsets[bucket - 1];
+            }
+
+            let mut positions = table_offsets[..LSH_BUCKETS].to_vec();
+            let table_indices_start = table * record_count;
+            let table_indices =
+                &mut indices[table_indices_start..table_indices_start + record_count];
+
+            for (record_index, &bucket) in hashes.iter().enumerate() {
+                let bucket = bucket as usize;
+                let position = positions[bucket] as usize;
+                table_indices[position] = record_index as u32;
+                positions[bucket] += 1;
+            }
+        }
+
+        Ok(Self {
+            record_count,
+            offsets,
+            indices,
+        })
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.record_count
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        (self.offsets.len() + self.indices.len()) * std::mem::size_of::<u32>()
+    }
+
+    pub fn collect_candidates(&self, query: &[i16; VECTOR_DIMENSIONS], output: &mut Vec<u32>) {
+        output.clear();
+
+        for table in 0..LSH_TABLES {
+            let bucket = lsh_hash(table, query) as usize;
+            self.extend_bucket(table, bucket, output);
+
+            for bit in 0..LSH_BITS {
+                self.extend_bucket(table, bucket ^ (1usize << bit), output);
+            }
+        }
+    }
+
+    fn extend_bucket(&self, table: usize, bucket: usize, output: &mut Vec<u32>) {
+        if output.len() >= MAX_INDEX_CANDIDATES {
+            return;
+        }
+
+        let table_offsets_start = table * (LSH_BUCKETS + 1);
+        let start = self.offsets[table_offsets_start + bucket] as usize;
+        let end = self.offsets[table_offsets_start + bucket + 1] as usize;
+        let table_indices_start = table * self.record_count;
+        let bucket_indices = &self.indices[table_indices_start + start..table_indices_start + end];
+        let remaining = MAX_INDEX_CANDIDATES - output.len();
+
+        if bucket_indices.len() <= remaining {
+            output.extend_from_slice(bucket_indices);
+        } else {
+            output.extend_from_slice(&bucket_indices[..remaining]);
+        }
     }
 }
 
@@ -273,9 +496,8 @@ impl<'de> Visitor<'de> for ReferenceDatasetVisitor {
     where
         A: SeqAccess<'de>,
     {
-        let mut dataset = ReferenceDataset::with_capacity(
-            seq.size_hint().unwrap_or(DEFAULT_REFERENCE_HINT),
-        );
+        let mut dataset =
+            ReferenceDataset::with_capacity(seq.size_hint().unwrap_or(DEFAULT_REFERENCE_HINT));
 
         while let Some(item) = seq.next_element::<ReferenceItem>()? {
             dataset.push_float_vector(&item.vector, item.label.as_u8());
@@ -310,6 +532,7 @@ impl ReferenceLabel {
 #[derive(Debug, Clone)]
 pub struct ResourcePaths {
     pub references_bin: PathBuf,
+    pub references_index: PathBuf,
     pub references_json_gz: PathBuf,
     pub mcc_risk: PathBuf,
     pub normalization: PathBuf,
@@ -327,6 +550,7 @@ impl ResourcePaths {
         let data_dir = data_dir.into();
         Self {
             references_bin: data_dir.join("references.bin"),
+            references_index: data_dir.join("references.index.bin"),
             references_json_gz: data_dir.join("references.json.gz"),
             mcc_risk: data_dir.join("mcc_risk.json"),
             normalization: data_dir.join("normalization.json"),
@@ -337,6 +561,7 @@ impl ResourcePaths {
 #[derive(Debug)]
 pub struct FraudEngine {
     dataset: ReferenceDataset,
+    index: Option<LshIndex>,
     normalization: Normalization,
     mcc_risk: MccRisk,
 }
@@ -360,8 +585,19 @@ impl FraudEngine {
             .into());
         }
 
+        let index = if dataset.len() > EXACT_SCAN_RECORD_LIMIT {
+            if paths.references_index.exists() {
+                Some(load_lsh_index(&paths.references_index, dataset.len())?)
+            } else {
+                Some(LshIndex::build(&dataset)?)
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             dataset,
+            index,
             normalization,
             mcc_risk,
         })
@@ -374,6 +610,7 @@ impl FraudEngine {
     ) -> Self {
         Self {
             dataset,
+            index: None,
             normalization,
             mcc_risk,
         }
@@ -387,13 +624,29 @@ impl FraudEngine {
         self.dataset.memory_bytes()
     }
 
+    pub fn index_memory_bytes(&self) -> usize {
+        self.index
+            .as_ref()
+            .map(LshIndex::memory_bytes)
+            .unwrap_or_default()
+    }
+
     pub fn score(&self, request: &FraudRequest) -> Result<FraudResponse, VectorizeError> {
         let vector = vectorize_transaction(request, &self.mcc_risk, &self.normalization)?;
         let query = quantize_vector(&vector);
-        let fraud_count = self
-            .dataset
-            .fraud_count_top5(&query)
-            .expect("dataset is validated with at least TOP_K records");
+        let fraud_count = if let Some(index) = &self.index {
+            self.dataset
+                .fraud_count_top5_indexed(&query, index)
+                .unwrap_or_else(|| {
+                    self.dataset
+                        .fraud_count_top5(&query)
+                        .expect("dataset is validated with at least TOP_K records")
+                })
+        } else {
+            self.dataset
+                .fraud_count_top5(&query)
+                .expect("dataset is validated with at least TOP_K records")
+        };
         Ok(decision_from_fraud_count(fraud_count))
     }
 }
@@ -480,6 +733,96 @@ pub fn save_references_bin(
 
     writer.flush()?;
     Ok(())
+}
+
+pub fn load_lsh_index(
+    path: impl AsRef<Path>,
+    expected_records: usize,
+) -> Result<LshIndex, BoxError> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != INDEX_MAGIC {
+        return Err("invalid references.index.bin magic header".into());
+    }
+
+    let record_count = read_u64_le(&mut reader)? as usize;
+    let table_count = read_u32_le(&mut reader)? as usize;
+    let bits = read_u32_le(&mut reader)? as usize;
+    let offsets_len = read_u64_le(&mut reader)? as usize;
+    let indices_len = read_u64_le(&mut reader)? as usize;
+
+    if record_count != expected_records {
+        return Err(format!(
+            "references.index.bin record count mismatch: index={}, dataset={}",
+            record_count, expected_records
+        )
+        .into());
+    }
+    if table_count != LSH_TABLES || bits != LSH_BITS {
+        return Err("references.index.bin was generated with incompatible LSH settings".into());
+    }
+    if offsets_len != LSH_TABLES * (LSH_BUCKETS + 1) {
+        return Err("references.index.bin has invalid offsets length".into());
+    }
+    if indices_len != LSH_TABLES * record_count {
+        return Err("references.index.bin has invalid indices length".into());
+    }
+
+    let offsets = read_u32_vec(&mut reader, offsets_len)?;
+    let indices = read_u32_vec(&mut reader, indices_len)?;
+
+    Ok(LshIndex {
+        record_count,
+        offsets,
+        indices,
+    })
+}
+
+pub fn save_lsh_index(path: impl AsRef<Path>, index: &LshIndex) -> Result<(), BoxError> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+
+    writer.write_all(INDEX_MAGIC)?;
+    writer.write_all(&(index.record_count as u64).to_le_bytes())?;
+    writer.write_all(&(LSH_TABLES as u32).to_le_bytes())?;
+    writer.write_all(&(LSH_BITS as u32).to_le_bytes())?;
+    writer.write_all(&(index.offsets.len() as u64).to_le_bytes())?;
+    writer.write_all(&(index.indices.len() as u64).to_le_bytes())?;
+
+    for value in &index.offsets {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    for value in &index.indices {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_u64_le(reader: &mut impl Read) -> Result<u64, BoxError> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u32_le(reader: &mut impl Read) -> Result<u32, BoxError> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u32_vec(reader: &mut impl Read, len: usize) -> Result<Vec<u32>, BoxError> {
+    let mut values = Vec::with_capacity(len);
+    let mut bytes = [0u8; 4];
+    for _ in 0..len {
+        reader.read_exact(&mut bytes)?;
+        values.push(u32::from_le_bytes(bytes));
+    }
+    Ok(values)
 }
 
 pub fn clamp01(value: f32) -> f32 {
@@ -622,6 +965,24 @@ pub fn squared_distance_i16(query: &[i16; VECTOR_DIMENSIONS], candidate: &[i16])
         distance += (delta * delta) as i64;
     }
     distance
+}
+
+fn lsh_hash(table: usize, vector: &[i16]) -> u16 {
+    debug_assert!(table < LSH_TABLES);
+    debug_assert_eq!(vector.len(), VECTOR_DIMENSIONS);
+
+    let mut hash = 0u16;
+    for bit in 0..LSH_BITS {
+        let mut projection = LSH_BIASES[table][bit];
+        for dimension in 0..VECTOR_DIMENSIONS {
+            projection += LSH_WEIGHTS[table][bit][dimension] * vector[dimension] as i32;
+        }
+
+        if projection >= 0 {
+            hash |= 1u16 << bit;
+        }
+    }
+    hash
 }
 
 pub fn fraud_score_from_count(fraud_count: u8) -> f32 {
@@ -833,8 +1194,11 @@ mod tests {
         let third = dataset.stratified_subsample(50, 99);
 
         assert_eq!(first.len(), 100);
-        let fraud_count: usize =
-            first.labels.iter().map(|&label| (label != 0) as usize).sum();
+        let fraud_count: usize = first
+            .labels
+            .iter()
+            .map(|&label| (label != 0) as usize)
+            .sum();
         assert_eq!(fraud_count, 50);
         assert_eq!(first.vectors, second.vectors);
         assert_ne!(first.vectors, third.vectors);
@@ -881,5 +1245,35 @@ mod tests {
                 fraud_score: 0.6
             }
         );
+    }
+
+    #[test]
+    fn lsh_index_roundtrips_and_collects_same_candidates() {
+        let mut dataset = ReferenceDataset::with_capacity(32);
+        for index in 0..32 {
+            let mut vector = [0.0; VECTOR_DIMENSIONS];
+            vector[0] = index as f32 / 31.0;
+            vector[2] = (31 - index) as f32 / 31.0;
+            vector[11] = f32::from(index % 2 == 0);
+            dataset.push_float_vector(&vector, u8::from(index % 3 == 0));
+        }
+
+        let index = LshIndex::build(&dataset).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("rinha_fraude_lsh_index_{}.bin", std::process::id()));
+
+        save_lsh_index(&path, &index).unwrap();
+        let loaded = load_lsh_index(&path, dataset.len()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.record_count(), dataset.len());
+        assert_eq!(loaded.memory_bytes(), index.memory_bytes());
+
+        let query = quantize_vector(&[0.5f32; VECTOR_DIMENSIONS]);
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        index.collect_candidates(&query, &mut first);
+        loaded.collect_candidates(&query, &mut second);
+        assert_eq!(first, second);
     }
 }

@@ -7,4 +7,5 @@
 
 # Artefatos gerados a partir do dataset; versionamos apenas o references.json.gz
 /data/references.bin
+/data/references.index.bin
 /data/references.json

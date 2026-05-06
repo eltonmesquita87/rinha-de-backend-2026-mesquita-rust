@@ -1,8 +1,10 @@
-use rinha_fraude_vetorial::{load_references_json_gz, save_references_bin};
+use rinha_fraude_vetorial::{
+    LshIndex, load_references_json_gz, save_lsh_index, save_references_bin,
+};
 use std::error::Error;
 use std::path::PathBuf;
 
-const DEFAULT_PER_CLASS: usize = 15_000;
+const DEFAULT_PER_CLASS: usize = 0;
 const DEFAULT_SEED: u64 = 0xC0FF_EEDE_ADBE_EF42;
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -13,6 +15,9 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let output = flag_str(&args, "--output")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("data/references.bin"));
+    let index_output = flag_str(&args, "--index-output")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data/references.index.bin"));
     let per_class: usize = flag_str(&args, "--max-per-class")
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_PER_CLASS);
@@ -21,7 +26,11 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or(DEFAULT_SEED);
 
     let full = load_references_json_gz(&input)?;
-    eprintln!("loaded {} reference records from {}", full.len(), input.display());
+    eprintln!(
+        "loaded {} reference records from {}",
+        full.len(),
+        input.display()
+    );
 
     let sampled = if per_class == 0 {
         full
@@ -38,6 +47,14 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     save_references_bin(&output, &sampled)?;
     eprintln!("wrote {} records to {}", sampled.len(), output.display());
+
+    let index = LshIndex::build(&sampled)?;
+    save_lsh_index(&index_output, &index)?;
+    eprintln!(
+        "wrote LSH index using {} bytes to {}",
+        index.memory_bytes(),
+        index_output.display()
+    );
 
     Ok(())
 }

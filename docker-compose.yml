@@ -10,12 +10,12 @@ x-api: &api
   tmpfs:
     - /tmp:size=8m,noexec,nosuid
   cpus: 0.475
-  mem_limit: 165m
+  mem_limit: 169m
   deploy:
     resources:
       limits:
         cpus: "0.475"
-        memory: 165M
+        memory: 169M
 
 services:
   haproxy:
@@ -33,12 +33,12 @@ services:
       - api2
     privileged: false
     cpus: 0.05
-    mem_limit: 20m
+    mem_limit: 12m
     deploy:
       resources:
         limits:
           cpus: "0.05"
-          memory: 20M
+          memory: 12M
 
   api1:
     <<: *api
